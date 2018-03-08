@@ -54,6 +54,8 @@ class DDPG(object):
         if self.clip_return is None:
             self.clip_return = np.inf
 
+        # Create the actor critic networks. network_class is defined in actor_critic.py
+        # This class is assigned to network_class when DDPG objest is created
         self.create_actor_critic = import_function(self.network_class)
 
         input_shapes = dims_to_shapes(self.input_dims)
@@ -67,12 +69,14 @@ class DDPG(object):
             if key.startswith('info_'):
                 continue
             stage_shapes[key] = (None, *input_shapes[key])
+        # Next state (o_2) and goal at next state (g_2)
         for key in ['o', 'g']:
             stage_shapes[key + '_2'] = stage_shapes[key]
         stage_shapes['r'] = (None,)
         self.stage_shapes = stage_shapes
 
-        # Create network.
+        # Create network
+        # Staging area is a datatype in tf to input data into GPUs
         with tf.variable_scope(self.scope):
             self.staging_tf = StagingArea(
                 dtypes=[tf.float32 for _ in self.stage_shapes.keys()],
@@ -83,7 +87,7 @@ class DDPG(object):
 
             self._create_network(reuse=reuse)
 
-        # Configure the replay buffer.
+        # Configure the replay buffer
         buffer_shapes = {key: (self.T if key != 'o' else self.T+1, *input_shapes[key])
                          for key, val in input_shapes.items()}
         buffer_shapes['g'] = (buffer_shapes['g'][0], self.dimg)
@@ -95,6 +99,8 @@ class DDPG(object):
     def _random_action(self, n):
         return np.random.uniform(low=-self.max_u, high=self.max_u, size=(n, self.dimu))
 
+    # Preprocessing by clipping the goal and state variables
+    # Not sure about the relative_goal part
     def _preprocess_og(self, o, ag, g):
         if self.relative_goals:
             g_shape = g.shape
@@ -106,6 +112,11 @@ class DDPG(object):
         g = np.clip(g, -self.clip_obs, self.clip_obs)
         return o, g
 
+    # target is the target policy network and main is the one which is updated
+    # target is updated by moving the parameters towards that of the main
+    # pi_tf is the output of the neural network, Q_pi_tf is the output of the Q network used for training pi_tf
+    # i.e., Q_pi_tf uses the pi_tf's action to evaluate the value 
+    # While just Q_tf uses the action which was actually taken
     def get_actions(self, o, ag, g, noise_eps=0., random_eps=0., use_target_net=False,
                     compute_Q=False):
         o, g = self._preprocess_og(o, ag, g)
@@ -146,6 +157,7 @@ class DDPG(object):
 
         self.buffer.store_episode(episode_batch)
 
+        # Updating stats
         if update_stats:
             # add transitions to normalizer
             episode_batch['o_2'] = episode_batch['o'][:, 1:, :]
@@ -184,6 +196,7 @@ class DDPG(object):
         self.Q_adam.update(Q_grad, self.Q_lr)
         self.pi_adam.update(pi_grad, self.pi_lr)
 
+    # Sample a batch for mini batch gradient descent, already defined in replay_buffer.py
     def sample_batch(self):
         transitions = self.buffer.sample(self.batch_size)
         o, o_2, g = transitions['o'], transitions['o_2'], transitions['g']
@@ -248,7 +261,7 @@ class DDPG(object):
                                 for i, key in enumerate(self.stage_shapes.keys())])
         batch_tf['r'] = tf.reshape(batch_tf['r'], [-1, 1])
 
-        # networks
+        # Create main and target networks, each will have a pi_tf, Q_tf and Q_pi_tf
         with tf.variable_scope('main') as vs:
             if reuse:
                 vs.reuse_variables()
@@ -286,9 +299,13 @@ class DDPG(object):
         self.pi_adam = MpiAdam(self._vars('main/pi'), scale_grad_by_procs=False)
 
         # polyak averaging
+        # 'main/Q' is a way of communicating the scope of the variables
+        # _vars has a way to understand this
         self.main_vars = self._vars('main/Q') + self._vars('main/pi')
         self.target_vars = self._vars('target/Q') + self._vars('target/pi')
         self.stats_vars = self._global_vars('o_stats') + self._global_vars('g_stats')
+        # Update the networks
+        # target net is updated by using polyak averaging
         self.init_target_net_op = list(
             map(lambda v: v[0].assign(v[1]), zip(self.target_vars, self.main_vars)))
         self.update_target_net_op = list(
